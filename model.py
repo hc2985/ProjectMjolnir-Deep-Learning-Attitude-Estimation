@@ -28,7 +28,7 @@ import numpy as np
 import math
 import time
 import os
-from symbol import import_from
+
 # Shuffling the data
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
