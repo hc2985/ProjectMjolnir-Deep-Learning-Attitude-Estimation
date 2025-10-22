@@ -6,13 +6,11 @@ import tensorflow_addons as tfa
 from keras import backend as K
 from model import Model_A
 
-
 # =========================
 # CONFIGURATION
 # =========================
 window_size = 100
 stride = 10
-fs_value = 50  # Hz
 weights_filename = "Model_A_B500_E300_V2.hdf5"
 data_filename = "data.csv"
 
@@ -34,102 +32,85 @@ df = pd.read_csv(data_path)
 df.columns = [c.strip().lower() for c in df.columns]
 print("Detected columns:", df.columns.tolist())
 
+# Build absolute timestamps from Timestamp + Milliseconds
+df["abs_time"] = pd.to_datetime(df["timestamp"], format="%Y-%m-%d %H:%M:%S") \
+                   + pd.to_timedelta(df["milliseconds"], unit="ms")
+timestamps = (df["abs_time"] - df["abs_time"].iloc[0]).dt.total_seconds().to_numpy()
+
+# Raw sensors
 acc_raw = df[["accx", "accy", "accz"]].to_numpy().astype(np.float32)
-gyro_raw = df[["gyrox", "gyroy", "gyroz"]].to_numpy().astype(np.float32)
+gyro_raw = df[["gyrox", "gyroy", "gyroz"]].to_numpy().astype(np.float32)  # likely deg/s
 
 # =========================
 # FRAME REMAPPING (Bike → Model)
+# Bike:  x=down, y=left, z=forward
+# Model: x=forward, y=right, z=down
 # =========================
-# Bike frame:  x = down, y = left, z = forward
-# Model frame: x = forward, y = right, z = down
-
-MAPPING_OPTION = 1  # Try 1–4 if alignment looks wrong
+MAPPING_OPTION = 1
 
 if MAPPING_OPTION == 1:
     print("Using mapping option 1: Standard (yaw inverted)")
-    acc = np.column_stack([
-        acc_raw[:, 2],      # forward
-        -acc_raw[:, 1],     # right
-        acc_raw[:, 0]       # down
-    ])
-    gyro = np.column_stack([
-        gyro_raw[:, 2],
-        -gyro_raw[:, 1],
-        -gyro_raw[:, 0]
-    ])
-
+    acc = np.column_stack([acc_raw[:, 2], -acc_raw[:, 1], acc_raw[:, 0]])
+    gyro = np.column_stack([gyro_raw[:, 2], -gyro_raw[:, 1], -gyro_raw[:, 0]])  # deg/s
 elif MAPPING_OPTION == 2:
     print("Using mapping option 2: Z-up convention")
-    acc = np.column_stack([
-        acc_raw[:, 2],
-        -acc_raw[:, 1],
-        -acc_raw[:, 0]
-    ])
-    gyro = np.column_stack([
-        gyro_raw[:, 2],
-        -gyro_raw[:, 1],
-        -gyro_raw[:, 0]
-    ])
-
+    acc = np.column_stack([acc_raw[:, 2], -acc_raw[:, 1], -acc_raw[:, 0]])
+    gyro = np.column_stack([gyro_raw[:, 2], -gyro_raw[:, 1], -gyro_raw[:, 0]])
 elif MAPPING_OPTION == 3:
     print("Using mapping option 3: No y-axis flip")
-    acc = np.column_stack([
-        acc_raw[:, 2],
-        acc_raw[:, 1],
-        acc_raw[:, 0]
-    ])
-    gyro = np.column_stack([
-        gyro_raw[:, 2],
-        gyro_raw[:, 1],
-        -gyro_raw[:, 0]
-    ])
-
+    acc = np.column_stack([acc_raw[:, 2], acc_raw[:, 1], acc_raw[:, 0]])
+    gyro = np.column_stack([gyro_raw[:, 2], gyro_raw[:, 1], -gyro_raw[:, 0]])
 elif MAPPING_OPTION == 4:
     print("Using mapping option 4: 180° rotation")
-    acc = np.column_stack([
-        -acc_raw[:, 2],
-        acc_raw[:, 1],
-        acc_raw[:, 0]
-    ])
-    gyro = np.column_stack([
-        -gyro_raw[:, 2],
-        gyro_raw[:, 1],
-        -gyro_raw[:, 0]
-    ])
+    acc = np.column_stack([-acc_raw[:, 2], acc_raw[:, 1], acc_raw[:, 0]])
+    gyro = np.column_stack([-gyro_raw[:, 2], gyro_raw[:, 1], -gyro_raw[:, 0]])
 
-# =========================
-# DEBUG PRINTS
-# =========================
 print("\nFrame remapping check:")
 print("acc sample (before norm):", acc_raw[0])
 print("acc mapped (bike→model):", acc[0])
 print("gyro sample (deg/s):", gyro_raw[0])
-print("gyro mapped (before rad/s conversion):", gyro[0])
+print("gyro mapped (deg/s):", gyro[0])
 
-# Normalize accelerometer and convert gyro to radians/sec
-acc_normalized = acc / np.linalg.norm(acc, axis=1, keepdims=True)
+# Normalize accelerometer (safe-divide)
+norm = np.linalg.norm(acc, axis=1, keepdims=True)
+norm[norm == 0] = 1.0
+acc_normalized = acc / norm
+
+# Gyro to rad/s for all downstream integration
 gyro_rad = np.deg2rad(gyro)
 
 # =========================
-# CREATE OVERLAPPING WINDOWS
+# CREATE OVERLAPPING WINDOWS (+ keep indices)
 # =========================
-def make_windows(arr, window_size, step):
-    N = len(arr)
-    idxs = range(0, N - window_size + 1, step)
-    return np.stack([arr[i:i + window_size] for i in idxs], axis=0)
+N = len(acc_normalized)
+idxs = list(range(0, N - window_size + 1, stride))  # window start indices
 
-acc_windows = make_windows(acc_normalized, window_size, stride)
-gyro_windows = make_windows(gyro_rad, window_size, stride)
-fs_input = np.full((len(acc_windows), 1), fs_value)
+def stack_windows(arr, starts, w):
+    return np.stack([arr[s:s + w] for s in starts], axis=0)
+
+acc_windows = stack_windows(acc_normalized, idxs, window_size)
+gyro_windows = stack_windows(gyro_rad,       idxs, window_size)
+
+# Per-window effective sampling frequency (for model input)
+# fs ≈ (window_size - 1) / duration_of_window
+win_durations = np.array([
+    max(timestamps[s + window_size - 1] - timestamps[s], 1e-6) for s in idxs
+], dtype=np.float64)
+fs_per_window = (window_size - 1) / win_durations
+fs_input = fs_per_window.reshape(-1, 1).astype(np.float32)
 
 print(f"\nPrepared {len(acc_windows)} windows of shape {acc_windows.shape}")
+print(f"Mean fs from data: {fs_per_window.mean():.2f} Hz")
+
+# End time of each window (align predictions to these times)
+times = np.array([timestamps[s + window_size - 1] for s in idxs], dtype=np.float64)
 
 # =========================
 # MODEL INFERENCE
 # =========================
 print("\nRunning model inference...")
 pred_quats = model.predict([acc_windows, gyro_windows, fs_input], verbose=1)
-np.savetxt("predicted_quaternions.csv", pred_quats, delimiter=",", fmt="%.6f")
+np.savetxt("predicted_quaternions2.csv", pred_quats, delimiter=",", fmt="%.6f")
 print("✅ Predictions saved to predicted_quaternions.csv")
 
 # =========================
@@ -141,7 +122,7 @@ print("Example quaternion (first window):", pred_quats[0])
 quat_std = np.std(pred_quats, axis=0)
 print("Quaternion std (w,x,y,z):", quat_std)
 
-angles = 2 * np.arccos(np.clip(pred_quats[:, 0], -1, 1))
+angles = 2 * np.arccos(np.clip(pred_quats[:, 0], -1.0, 1.0))
 print(f"Rotation angles - mean: {np.degrees(angles.mean()):.2f}°, "
       f"max: {np.degrees(angles.max()):.2f}°, "
       f"min: {np.degrees(angles.min()):.2f}°")
@@ -151,97 +132,160 @@ print(f"Quaternion norms - mean: {norms.mean():.6f}, "
       f"min: {norms.min():.6f}, max: {norms.max():.6f}")
 
 # =========================
-# CONVERT QUATERNIONS TO EULER ANGLES
+# QUATERNION → EULER (rad)
 # =========================
 def quat_to_euler(q):
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    roll = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
-    pitch = np.arcsin(np.clip(2*(w*y - x*z), -1, 1))
-    yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+    roll  = np.arctan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
+    pitch = np.arcsin(np.clip(2*(w*y - x*z), -1.0, 1.0))
+    yaw   = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
     return roll, pitch, yaw
 
 roll_pred, pitch_pred, yaw_pred = quat_to_euler(pred_quats)
 
 # =========================
-# CALIBRATION
+# CALIBRATION (bias removal)
 # =========================
-CALIBRATION_SAMPLES = 10
-roll_offset = np.mean(roll_pred[:CALIBRATION_SAMPLES])
+CALIBRATION_SAMPLES = min(10, len(roll_pred))
+roll_offset  = np.mean(roll_pred[:CALIBRATION_SAMPLES])
 pitch_offset = np.mean(pitch_pred[:CALIBRATION_SAMPLES])
 
 print("\n=== CALIBRATION OFFSETS ===")
-print(f"Roll offset: {np.degrees(roll_offset):.2f}°")
+print(f"Roll offset:  {np.degrees(roll_offset):.2f}°")
 print(f"Pitch offset: {np.degrees(pitch_offset):.2f}°")
 
-roll_pred -= roll_offset
-pitch_pred -= pitch_offset
+roll_pred  = roll_pred  - roll_offset
+pitch_pred = pitch_pred - pitch_offset
 
 print(f"\nModel yaw range: {np.degrees(yaw_pred.min()):.2f}° to {np.degrees(yaw_pred.max()):.2f}°")
 print(f"Roll range: {np.degrees(roll_pred.min()):.2f}° to {np.degrees(roll_pred.max()):.2f}°")
 print(f"Pitch range: {np.degrees(pitch_pred.min()):.2f}° to {np.degrees(pitch_pred.max()):.2f}°")
 
 # =========================
-# INTEGRATE GYRO FOR YAW
+# INTEGRATE GYRO FOR YAW (rad) — aligned to window ends
 # =========================
 print("\n=== INTEGRATING YAW FROM GYROSCOPE ===")
 
-yaw_integrated = np.zeros(len(pred_quats))
-dt = stride / fs_value
+num_windows = len(idxs)
+yaw_integrated = np.zeros(num_windows, dtype=np.float64)  # radians
 
-for i in range(1, len(pred_quats)):
-    start = i * stride
-    end = min(start + stride, len(gyro))
-    gyro_z_avg = np.mean(gyro[start:end, 2])
-    yaw_integrated[i] = yaw_integrated[i - 1] + gyro_z_avg * dt
+# End indices for each prediction window
+end_indices = np.array([s + window_size - 1 for s in idxs], dtype=int)
 
-print(f"Integrated yaw range: {yaw_integrated.min():.2f}° to {yaw_integrated.max():.2f}°")
-print(f"Total yaw change: {yaw_integrated[-1] - yaw_integrated[0]:.2f}°")
+for i in range(1, num_windows):
+    prev_end = end_indices[i - 1]
+    curr_end = end_indices[i]
+    start = prev_end + 1
+    end = curr_end + 1  # slice end-exclusive
+
+    if start >= end or end > len(gyro_rad):
+        # Fallback: use a single-sample dt if something edge-casey happens
+        dt_step = max(times[i] - times[i - 1], 1e-6)
+        gyro_z_avg = gyro_rad[min(curr_end, len(gyro_rad) - 1), 2]
+    else:
+        dt_step = timestamps[end - 1] - timestamps[start - 1]
+        dt_step = max(dt_step, 1e-9)
+        gyro_z_avg = np.mean(gyro_rad[start:end, 2])  # rad/s
+
+    yaw_integrated[i] = yaw_integrated[i - 1] + gyro_z_avg * dt_step  # radians
+
+print(f"Integrated yaw range: {np.degrees(yaw_integrated.min()):.2f}° to {np.degrees(yaw_integrated.max()):.2f}°")
+print(f"Total yaw change:     {np.degrees(yaw_integrated[-1] - yaw_integrated[0]):.2f}°")
 
 # =========================
-# COMBINE RESULTS
+# SAVE RESULTS (degrees)
 # =========================
-times = np.arange(len(pred_quats)) * dt
-
-print("\n=== FINAL ORIENTATION SAMPLE ===")
-for i in range(min(10, len(times))):
-    print(f"t={times[i]:6.2f}s | yaw={yaw_integrated[i]:8.2f}° | "
-          f"roll={np.degrees(roll_pred[i]):8.2f}° | pitch={np.degrees(pitch_pred[i]):8.2f}°")
-if len(times) > 10:
-    print("...")
-    for i in range(max(len(times) - 3, 10), len(times)):
-        print(f"t={times[i]:6.2f}s | yaw={yaw_integrated[i]:8.2f}° | "
-              f"roll={np.degrees(roll_pred[i]):8.2f}° | pitch={np.degrees(pitch_pred[i]):8.2f}°")
-
-# =========================
-# SAVE RESULTS
-# =========================
-results = np.column_stack([times, yaw_integrated,
-                           np.degrees(roll_pred), np.degrees(pitch_pred)])
-np.savetxt("predicted_orientation.csv", results, delimiter=",", fmt="%.4f",
-           header="time(s),yaw(deg),roll(deg),pitch(deg)", comments="")
+results = np.column_stack([
+    times,
+    np.degrees(yaw_integrated),
+    np.degrees(roll_pred),
+    np.degrees(pitch_pred),
+])
+np.savetxt(
+    "predicted_orientation2.csv",
+    results,
+    delimiter=",",
+    fmt="%.4f",
+    header="time(s),yaw(deg),roll(deg),pitch(deg)",
+    comments="",
+)
 print("\n✅ Full orientation saved to predicted_orientation.csv")
 
-np.savetxt("predicted_yaw.csv",
-           np.column_stack([times, yaw_integrated]),
-           delimiter=",", fmt="%.4f",
-           header="time(s),yaw(deg)", comments="")
+np.savetxt(
+    "predicted_yaw2.csv",
+    np.column_stack([times, np.degrees(yaw_integrated)]),
+    delimiter=",",
+    fmt="%.4f",
+    header="time(s),yaw(deg)",
+    comments="",
+)
 print("✅ Yaw angles saved to predicted_yaw.csv")
 
 # =========================
 # BASIC MOTION ANALYSIS
 # =========================
 print("\n=== MOTION ANALYSIS ===")
-yaw_changes = np.diff(yaw_integrated)
+if len(times) >= 2:
+    dt_steps = np.diff(times)
+    dt_steps = np.where(dt_steps <= 0, 1e-6, dt_steps)
+    yaw_changes = np.diff(yaw_integrated)  # rad
+    yaw_rate = yaw_changes / dt_steps      # rad/s
 
-if len(yaw_changes):
     print("Yaw rate stats:")
-    print(f"  Mean: {np.mean(yaw_changes) / dt:.2f}°/s")
-    print(f"  Max: {np.max(yaw_changes) / dt:.2f}°/s")
-    print(f"  Min: {np.min(yaw_changes) / dt:.2f}°/s")
+    print(f"  Mean: {np.degrees(np.mean(yaw_rate)):.2f}°/s")
+    print(f"  Max:  {np.degrees(np.max(yaw_rate)):.2f}°/s")
+    print(f"  Min:  {np.degrees(np.min(yaw_rate)):.2f}°/s")
 
-    turn_threshold = 2.0
-    left_turns = np.sum(yaw_changes > turn_threshold)
-    right_turns = np.sum(yaw_changes < -turn_threshold)
-    print(f"\nTurn detection (>{turn_threshold}°/step):")
-    print(f"  Left turns: {left_turns}")
+    turn_threshold_deg = 2.0
+    turn_threshold_rad = np.deg2rad(turn_threshold_deg)
+    left_turns  = np.sum(yaw_changes >  turn_threshold_rad)
+    right_turns = np.sum(yaw_changes < -turn_threshold_rad)
+    print(f"\nTurn detection (>{turn_threshold_deg:.1f}°/step):")
+    print(f"  Left turns:  {left_turns}")
     print(f"  Right turns: {right_turns}")
+else:
+    print("Not enough samples for motion analysis.")
+# =========================
+# YAW RATE CLASSIFICATION (deg/s)
+# =========================
+print("\n=== YAW RATE CLASSIFICATION ===")
+
+# unwrap integrated yaw (radians → degrees)
+yaw_deg_int = np.degrees(yaw_integrated)
+yaw_deg_int_unwrapped = np.degrees(np.unwrap(np.radians(yaw_deg_int), discont=np.pi))
+
+# deltas and dt
+yaw_deltas = np.diff(yaw_deg_int_unwrapped)  # deg
+dt_steps = np.diff(times)                    # sec
+dt_steps = np.where(dt_steps <= 0, 1e-6, dt_steps)
+
+yaw_rate = yaw_deltas / dt_steps             # deg/s
+yaw_times = times[1:]
+
+def classify(rate):
+    mag = abs(rate)
+    if mag < 2.0:
+        return "straight"
+    elif mag < 5.0:
+        return "slight right" if rate > 0 else "slight left"
+    elif mag < 15.0:
+        return "normal right" if rate > 0 else "normal left"
+    else:
+        return "major right" if rate > 0 else "major left"
+
+labels = [classify(r) for r in yaw_rate]
+
+# Save
+out_df = pd.DataFrame({
+    "time(s)": yaw_times,
+    "delta_yaw(deg)": yaw_deltas,
+    "dt(s)": dt_steps,
+    "yaw_rate(deg/s)": yaw_rate,
+    "turn_type": labels
+})
+out_df.to_csv("yaw_rate_classified.csv", index=False, float_format="%.6f")
+
+print("✅ Saved yaw_rate_classified.csv")
+print("Stats: mean={:.2f}°/s, max={:.2f}°/s, min={:.2f}°/s".format(
+    yaw_rate.mean(), yaw_rate.max(), yaw_rate.min()
+))
